@@ -23,6 +23,97 @@ sed -i "s#_('Firmware Version'), (L\.isObject(boardinfo\.release) ? boardinfo\.r
 # 调节IPQ60XX的1.5GHz频率电压(从0.9375V提高到0.95V，过低可能导致不稳定，过高可能增加功耗和发热，具体数值需要根据实际情况调整)
 # sed -i 's/opp-microvolt = <937500>;/opp-microvolt = <950000>;/' target/linux/qualcommax/patches-6.12/0038-v6.16-arm64-dts-qcom-ipq6018-add-1.5GHz-CPU-Frequency.patch
 
+# 京东云太乙 ER1 不使用这些镜像格式/封装路径，裁掉对应 host tools。
+if grep -q '^CONFIG_TARGET_PROFILE="DEVICE_jdcloud_re-cs-07"$' .config 2>/dev/null; then
+  sed -i -E '/^tools-y \+= (erofs-utils|make-ext4fs|dosfstools|mtools|mtd-utils|e2fsprogs|zip)$/d' tools/Makefile
+fi
+
+# 使用官方下载源，移除国内镜像。
+function use_official_download_sources() {
+  if [ -f scripts/projectsmirrors.json ]; then
+    python3 - <<'PY'
+import json
+from pathlib import Path
+
+path = Path("scripts/projectsmirrors.json")
+data = json.loads(path.read_text())
+blocked = (
+    "mirrors.tencent.com",
+    "mirrors.aliyun.com",
+    "mirrors.tuna.tsinghua.edu.cn",
+    "mirrors.ustc.edu.cn",
+    "mirror.ustc.edu.cn",
+    "mirror.nju.edu.cn",
+    "mirror.iscas.ac.cn",
+    "gitmirror.com",
+    "ghproxy",
+    "fastgit",
+)
+official = {
+    "@DEBIAN": ["https://deb.debian.org/debian", "https://ftp.debian.org/debian"],
+    "@APACHE": ["https://dlcdn.apache.org", "https://archive.apache.org/dist"],
+    "@GNU": ["https://ftpmirror.gnu.org", "https://ftp.gnu.org/gnu"],
+    "@KERNEL": ["https://cdn.kernel.org/pub"],
+    "@GNOME": ["https://download.gnome.org/sources"],
+    "@OPENWRT": ["https://downloads.openwrt.org", "https://sources.cdn.openwrt.org", "https://sources.openwrt.org"],
+    "@IMMORTALWRT": ["https://downloads.immortalwrt.org", "https://sources-cdn.immortalwrt.org", "https://sources.immortalwrt.org"],
+}
+
+for key, mirrors in list(data.items()):
+    data[key] = [mirror for mirror in mirrors if not any(domain in mirror for domain in blocked)]
+
+for key, mirrors in official.items():
+    existing = data.get(key, [])
+    data[key] = mirrors + [mirror for mirror in existing if mirror not in mirrors]
+
+path.write_text(json.dumps(data, indent="\t") + "\n")
+PY
+  fi
+
+  if [ -f scripts/download.pl ]; then
+    sed -i '/raw\.gitmirror\.com/d' scripts/download.pl
+  fi
+
+  find feeds package -type f -name Makefile -print0 2>/dev/null | xargs -0 -r sed -i \
+    -e 's#https://mirrors.tencent.com/npm/#https://registry.npmjs.org/#g' \
+    -e 's#https://mirrors.tencent.com/nodejs-release/#https://nodejs.org/dist/#g' \
+    -e 's#https://mirrors.ustc.edu.cn/golang/#https://go.dev/dl/#g' \
+    -e 's#https://mirrors.tencent.com/qt/archive/qt/#https://download.qt.io/archive/qt/#g' \
+    -e 's#https://mirrors.aliyun.com/qt/archive/qt/#https://download.qt.io/archive/qt/#g'
+}
+
+function relax_vendor_driver_werror() {
+  local makefile="$1"
+  shift
+  [ -f "$makefile" ] || return 0
+
+  local flags="$*"
+  MAKEFILE="$makefile" WNO_ERROR_FLAGS="$flags" python3 - <<'PY'
+import os
+from pathlib import Path
+
+path = Path(os.environ["MAKEFILE"])
+flags = os.environ["WNO_ERROR_FLAGS"].split()
+marker = "# openwrt-ci-roc: keep global WERROR, relax warnings for this vendor driver."
+text = path.read_text()
+
+if marker in text:
+    raise SystemExit
+
+insert = "\n" + marker + "\n" + "".join(
+    f"NOSTDINC_FLAGS += {flag}\n" for flag in flags
+)
+needle = "\ndefine Build/Compile\n"
+
+if needle in text:
+    text = text.replace(needle, insert + needle, 1)
+else:
+    text = text.rstrip() + insert + "\n"
+
+path.write_text(text)
+PY
+}
+
 # 移除要替换的包
 rm -rf feeds/luci/applications/luci-app-argon-config
 rm -rf feeds/luci/applications/luci-app-wechatpush
@@ -86,5 +177,16 @@ git clone --depth=1 https://github.com/vernesong/OpenClash package/luci-app-open
 # 清理 PassWall 的 chnlist 规则文件
 echo "baidu.com"  > package/luci-app-passwall/luci-app-passwall/root/usr/share/passwall/rules/chnlist
 
+use_official_download_sources
+
 ./scripts/feeds update -a
 ./scripts/feeds install -a
+
+relax_vendor_driver_werror package/kernel/rtl8189es/Makefile \
+  -Wno-error=missing-prototypes \
+  -Wno-error=empty-body \
+  -Wno-error=stringop-overread
+relax_vendor_driver_werror package/kernel/rtl8188eu/Makefile \
+  -Wno-error=empty-body
+relax_vendor_driver_werror package/kernel/aic8800/Makefile \
+  -Wno-error=unused-variable
